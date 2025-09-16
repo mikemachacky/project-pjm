@@ -2,7 +2,7 @@ import numpy as np
 
 
 class RealTimeTools:
-
+    @staticmethod
     def extract_hand_landmarks(hand_landmarks):
         if not hand_landmarks:
             return None
