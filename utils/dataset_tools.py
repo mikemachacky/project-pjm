@@ -1,5 +1,4 @@
 import numpy as np
-import tensorflow as tf
 
 class DatasetTools:
     SEQUENCE_SIZE = 30
@@ -20,34 +19,36 @@ class DatasetTools:
         for sample_id, group in df.groupby('sample_id'):
             group = group.sort_values('frame').reset_index(drop=True)
             label = group.loc[0, 'label']
-            data = group.drop(columns=['sample_id', 'frame', 'label'], errors='ignore')
+            data = group.drop(columns=['sample_id', 'frame', 'label'], errors='ignore').values
 
-            for start in range(0, len(data) - DatasetTools.SEQUENCE_SIZE + 1):
-                segment = data.iloc[start:start + DatasetTools.SEQUENCE_SIZE].values
-                sequences.append(segment)
-                labels.append(label)
+            if len(data) != 30:
+                print("Dropping: ", sample_id)
+                continue  # pomiń próbki o niepoprawnej długości
+
+            sequences.append(data)
+            labels.append(label)
 
         return np.array(sequences), np.array(labels)
 
     @staticmethod
     def _augment_np(sequence_np: np.ndarray, augment_cfg: dict) -> np.ndarray:
         """
-        Bezpieczna augmentacja na numpy (łatwiej debugować). sequence_np shape = (seq_len, features)
+        Augmentacja danych z numpy. sequence_np shape = (seq_len, features)
         augment_cfg: dict z bool dla kluczy: 'flip', 'gaussian_noise', 'speckle_noise', 'salt_pepper'
         """
         seq = sequence_np.astype(np.float32).copy()
         seq_frames = seq.reshape(seq.shape[0], DatasetTools.LANDMARKS_SIZE, DatasetTools.DIMENSIONS)  # (T,21,3)
 
-        # Flip X (odwrócenie osi X)
+        # Odwrócenie osi X)
         if augment_cfg.get('flip', False):
             seq_frames[..., 0] = -seq_frames[..., 0]
 
-        # Gaussian noise
+        # Szum Gaussa
         if augment_cfg.get('gaussian_noise', False):
             std = augment_cfg.get('gaussian_std', 0.01)
             seq_frames += np.random.normal(0.0, std, size=seq_frames.shape).astype(np.float32)
 
-        # Speckle noise (multiplicative)
+        # Speckle noise (multiplikatywny)
         if augment_cfg.get('speckle_noise', False):
             std = augment_cfg.get('speckle_std', 0.01)
             noise = np.random.normal(0.0, std, size=seq_frames.shape).astype(np.float32)
@@ -68,64 +69,31 @@ class DatasetTools:
     def augment_generator(sequences, labels, batch_size, augment_config,
                           multiplier: int = 1, include_original: bool = True, random_state: int = None):
         """
-        Zwraca generator yielding batches. Dla każdej sekwencji:
-          - jeśli include_original=True: zachowuje oryginał jako jeden z przykładów,
-          - multiplier: ile łącznie przykładów (wliczając oryginał, jeśli include_original=True)
-            ma się pojawić per oryginał. Przykłady:
-              multiplier=1, include_original=True -> tylko oryginały
-              multiplier=3, include_original=True -> 1 oryginał + 2 augmenty
-              multiplier=3, include_original=False -> 3 augmenty na oryginał
-        augment_config może zawierać dodatkowe parametry (np. gaussian_std).
+        Generator augmentacji:
+        - include_original=True -> dodaje oryginały,
+        - multiplier -> ile razy powielić każdy przykład (w tym oryginał, jeśli include_original=True)
         """
         if random_state is not None:
             np.random.seed(random_state)
 
-        num_samples = len(sequences)
-        augment_types = [k for k, v in augment_config.items() if isinstance(v, bool) and v]
-
-        # sanity check
-        if multiplier < 1:
-            raise ValueError("multiplier musi być >= 1")
-
-        # przygotuj listę (sequence, label) do zwrócenia
         out_seqs = []
         out_labels = []
 
-        for i in range(num_samples):
-            orig = sequences[i]
-            lbl = labels[i]
-
+        for seq, lbl in zip(sequences, labels):
+            examples = []
             if include_original:
-                out_seqs.append(orig)
-                out_labels.append(lbl)
+                examples.append(seq)
 
-            # ile dodatkowych wariantów stworzyć
-            extra = multiplier - (1 if include_original else 0)
-            for _ in range(extra):
-                # stwórz losową konfigurację augmentacji na podstawie augment_config
-                # (dla każdego typu decydujemy losowo, czy zastosować; pozwala łączyć augmenty)
-                cfg = {}
-                for key, val in augment_config.items():
-                    if isinstance(val, bool):
-                        # jeśli włączone globalnie, stosuj z p=0.5 (możesz zmienić)
-                        cfg[key] = val and (np.random.rand() < 0.8)  # 80% szansy użycia w wariancie
-                    else:
-                        # jeśli wartość parametryczna (np. std, prob), przekaż ją dalej
-                        cfg[key] = val
-                augmented = DatasetTools._augment_np(orig, cfg)
-                out_seqs.append(augmented)
-                out_labels.append(lbl)
+            for _ in range(multiplier - (1 if include_original else 0)):
+                examples.append(DatasetTools._augment_np(seq, augment_config))
+
+            out_seqs.extend(examples)
+            out_labels.extend([lbl] * len(examples))
 
         out_seqs = np.array(out_seqs, dtype=np.float32)
         out_labels = np.array(out_labels)
 
-        # generator batchowy
-        total = len(out_seqs)
-        indices = np.arange(total)
-        # losowe permutowanie — jeśli chcesz porządek zachować, usuń tę linię
-        np.random.shuffle(indices)
+        for i in range(0, len(out_seqs), batch_size):
+            yield out_seqs[i:i + batch_size], out_labels[i:i + batch_size]
 
-        for start in range(0, total, batch_size):
-            end = min(start + batch_size, total)
-            batch_idx = indices[start:end]
-            yield out_seqs[batch_idx], out_labels[batch_idx]
+
